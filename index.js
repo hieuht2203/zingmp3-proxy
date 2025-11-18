@@ -6,6 +6,48 @@ import crypto from "crypto";
 const app = express();
 const PORT = 5005;
 
+// Helper: normalize different shapes of lyricDetail from ZingMp3
+function parseLyricDetail(lyricDetail) {
+  if (!lyricDetail || !lyricDetail.data) return { type: 'none' };
+  const d = lyricDetail.data;
+
+  // If structured sentences (word-level timing)
+  if (Array.isArray(d.sentences) && d.sentences.length > 0) {
+    return { type: 'sentences', sentences: d.sentences, metadata: d.metadata };
+  }
+
+  // Some responses include a plain lyric string under different keys
+  if (typeof d.lyric === 'string' && d.lyric.trim()) {
+    return { type: 'text', text: d.lyric };
+  }
+
+  if (typeof d.lyrics === 'string' && d.lyrics.trim()) {
+    return { type: 'text', text: d.lyrics };
+  }
+
+  // Some providers put the raw lyric under 'content' or 'raw'
+  if (typeof d.content === 'string' && d.content.trim()) {
+    return { type: 'text', text: d.content };
+  }
+
+  if (typeof d.raw === 'string' && d.raw.trim()) {
+    return { type: 'text', text: d.raw };
+  }
+
+  // If there's an object with lines
+  if (Array.isArray(d.lines) && d.lines.length > 0) {
+    return { type: 'text', text: d.lines.map(l => (typeof l === 'string' ? l : l.text)).join('\n') };
+  }
+
+  // Zing sometimes returns a .lrc file URL in data.file
+  if (typeof d.file === 'string' && d.file.trim()) {
+    return { type: 'file', url: d.file };
+  }
+
+  // Nothing recognized
+  return { type: 'none' };
+}
+
 // ESP32 Authentication
 const SECRET_KEY = "your-esp32-secret-key-2024";
 
@@ -116,12 +158,21 @@ app.get("/stream_pcm", authenticateESP32, async (req, res) => {
       return res.status(404).json({ error: "Không lấy được link nhạc 128kbps" });
     }
 
-    // 🎼 Lấy link lời bài hát (nếu có)
+    // 🎼 Lấy link lời bài hát (nếu có). Trả về endpoint .lrc để ESP32 dễ parse
     let lyricUrl = "";
     try {
       const lyricDetail = await zing.ZingMp3.getLyric(result.encodeId);
-      if (lyricDetail.data && lyricDetail.data.sentences) {
-        lyricUrl = `/lyric?id=${result.encodeId}`;
+      const parsed = parseLyricDetail(lyricDetail);
+      console.log('ℹ️ lyricDetail shape:', parsed.type);
+      if (parsed.type !== 'none') {
+        // Trỏ tới endpoint trả về file LRC plain-text (endpoint will handle different shapes)
+        lyricUrl = `/lyric.lrc?id=${result.encodeId}`;
+      } else {
+        try {
+          console.log('⚠️ No parsed lyrics for', result.encodeId, '- raw lyricDetail:', JSON.stringify(lyricDetail).slice(0, 20000));
+        } catch (e) {
+          console.log('⚠️ No parsed lyrics and failed to stringify lyricDetail for', result.encodeId);
+        }
       }
     } catch (lyricErr) {
       console.log("⚠️ Không lấy được lời bài hát:", lyricErr.message);
@@ -171,11 +222,30 @@ app.get("/stream_pcm_debug", async (req, res) => {
     }
 
     // 📋 Trả về JSON với thông tin bài hát
+    // Nếu có lời, trả về endpoint .lrc giống /stream_pcm để test dễ dàng
+    let debugLyricUrl = "";
+    try {
+      const lyricDetail = await zing.ZingMp3.getLyric(result.encodeId);
+      const parsed = parseLyricDetail(lyricDetail);
+      console.log('🐛 DEBUG lyricDetail shape:', parsed.type);
+      if (parsed.type !== 'none') {
+        debugLyricUrl = `/lyric.lrc?id=${result.encodeId}`;
+      } else {
+        try {
+          console.log('⚠️ DEBUG no parsed lyrics for', result.encodeId, '- raw lyricDetail:', JSON.stringify(lyricDetail).slice(0,20000));
+        } catch (e) {
+          console.log('⚠️ DEBUG no parsed lyrics and failed to stringify lyricDetail for', result.encodeId);
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
     const response = {
       artist: result.artistsNames || artist,
       title: result.title || song,
       audio_url: `/audio?url=${encodeURIComponent(url128)}`,
-      lyric_url: "",
+      lyric_url: debugLyricUrl,
       duration: result.duration || 0,
       encodeId: result.encodeId
     };
@@ -196,20 +266,46 @@ app.get("/audio", async (req, res) => {
 
   try {
     console.log("🔊 Stream audio từ:", audioUrl);
+    // Hỗ trợ forward header Range từ ESP32 (nếu có) để yêu cầu partial content
+    const upstreamHeaders = {};
+    if (req.headers.range) {
+      upstreamHeaders['range'] = req.headers.range;
+      console.log('➡️ Forwarding Range header to upstream:', req.headers.range);
+    }
 
-    const response = await fetch(decodeURIComponent(audioUrl));
+    const response = await fetch(decodeURIComponent(audioUrl), { headers: upstreamHeaders });
 
     if (!response.ok) throw new Error("Không thể tải nhạc");
 
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-transform"); // 🔥 tránh CF nén/ghi đè
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("Accept-Ranges", "bytes");
+    // Forward một số header quan trọng từ upstream về client để tránh client nhúng (ESP32)
+    const headersToForward = {};
+    const ct = response.headers.get('content-type');
+    const cl = response.headers.get('content-length');
+    const cr = response.headers.get('content-range');
+    const ar = response.headers.get('accept-ranges');
+    const te = response.headers.get('transfer-encoding');
+
+    if (ct) headersToForward['Content-Type'] = ct;
+    else headersToForward['Content-Type'] = 'application/octet-stream';
+
+    if (cl) headersToForward['Content-Length'] = cl;
+    if (cr) headersToForward['Content-Range'] = cr;
+    if (ar) headersToForward['Accept-Ranges'] = ar;
+    if (te) headersToForward['Transfer-Encoding'] = te;
+
+    // Đảm bảo tránh một số proxy/edge re-encoding; đóng connection sau khi stream
+    headersToForward['Cache-Control'] = 'no-transform'; // tránh CF/edge nén
+    headersToForward['Connection'] = 'close';
+
+    // Thiết lập status và headers cho response trả về ESP32
+    res.status(response.status);
+    res.set(headersToForward);
 
     const nodeStream = Readable.fromWeb(response.body);
-    nodeStream.on("error", (err) => {
-      console.log("⚠️ Lỗi stream:", err.message);
-      res.end();
+    nodeStream.on('error', (err) => {
+      console.log('⚠️ Lỗi stream:', err.message);
+      // nếu còn header chưa gửi, gửi lỗi; cuối cùng close response
+      try { res.end(); } catch (e) { /* ignore */ }
     });
 
     nodeStream.pipe(res);
@@ -234,25 +330,133 @@ app.get("/lyric", async (req, res) => {
     console.log("🎼 Lấy lời bài hát cho ID:", songId);
 
     const lyricDetail = await zing.ZingMp3.getLyric(songId);
-    
-    if (!lyricDetail.data || !lyricDetail.data.sentences) {
-      return res.status(404).json({ error: "Không có lời bài hát" });
+    const parsed = parseLyricDetail(lyricDetail);
+    console.log('🎼 /lyric parsed type =', parsed.type);
+
+    if (parsed.type === 'sentences') {
+      const lyrics = parsed.sentences.map(sentence => ({
+        time: sentence.words[0]?.startTime || 0,
+        text: (sentence.words || []).map(word => word.data).join(' ').replace(/\s+/g, ' ').trim()
+      }));
+
+      return res.json({ lyrics: lyrics, total: lyrics.length });
     }
 
-    // Chuyển đổi format lời bài hát cho ESP32
-    const lyrics = lyricDetail.data.sentences.map(sentence => ({
-      time: sentence.words[0]?.startTime || 0,
-      text: sentence.words.map(word => word.data).join('')
-    }));
+    if (parsed.type === 'text') {
+      // Return plain text lines as fallback; time=0 for each line
+      const lines = parsed.text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const lyrics = lines.map(line => ({ time: 0, text: line }));
+      return res.json({ lyrics: lyrics, total: lyrics.length, raw: parsed.text });
+    }
 
-    res.json({
-      lyrics: lyrics,
-      total: lyrics.length
-    });
+    if (parsed.type === 'file') {
+      try {
+        console.log('🎼 /lyric fetching external LRC file:', parsed.url);
+        const r = await fetch(parsed.url);
+        if (!r.ok) throw new Error('Failed to fetch LRC file: ' + r.status);
+        const text = await r.text();
+        const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        const lyrics = lines.map(line => ({ time: 0, text: line }));
+        return res.json({ lyrics: lyrics, total: lyrics.length, raw: text, source: parsed.url });
+      } catch (e) {
+        console.log('⚠️ Failed to fetch external LRC file for', songId, e.message);
+        return res.status(502).json({ error: 'Không thể tải file lời từ nguồn ngoài' });
+      }
+    }
+    try {
+      console.log('⚠️ /lyric no parsed lyric for', songId, '- raw lyricDetail:', JSON.stringify(lyricDetail).slice(0,20000));
+    } catch (e) {
+      console.log('⚠️ /lyric no parsed lyric and failed to stringify lyricDetail for', songId);
+    }
+    return res.status(404).json({ error: 'Không có lời bài hát' });
 
   } catch (err) {
     console.error("🔥 Lỗi lấy lời bài hát:", err);
     res.status(500).json({ error: "Lỗi server: " + err.message });
+  }
+});
+
+// API trả lời lời bài hát ở định dạng .lrc (plain text) — phù hợp với client/ESP32 mong đợi
+app.get("/lyric.lrc", async (req, res) => {
+  const songId = req.query.id;
+
+  if (!songId) {
+    return res.status(400).send("Thiếu ID bài hát");
+  }
+
+  try {
+    console.log("🎼 Lấy lời bài hát (LRC) cho ID:", songId);
+
+    const lyricDetail = await zing.ZingMp3.getLyric(songId);
+  const parsed = parseLyricDetail(lyricDetail);
+  console.log('🎼 /lyric.lrc parsed type =', parsed.type);
+
+    if (parsed.type === 'sentences') {
+      const sentences = parsed.sentences;
+
+      const lines = [];
+      // Optional header metadata
+      if (parsed.metadata) {
+        const meta = parsed.metadata;
+        if (meta.title) lines.push(`[ti:${meta.title}]`);
+        if (meta.artists) lines.push(`[ar:${meta.artists}]`);
+        if (meta.album) lines.push(`[al:${meta.album}]`);
+      }
+
+      for (const sentence of sentences) {
+        const startMs = sentence.words && sentence.words[0] && sentence.words[0].startTime ? +sentence.words[0].startTime : 0;
+
+        const mm = Math.floor(startMs / 60000).toString().padStart(2, '0');
+        const ss = Math.floor((startMs % 60000) / 1000).toString().padStart(2, '0');
+        const cs = Math.floor((startMs % 1000) / 10).toString().padStart(2, '0');
+        const timestamp = `${mm}:${ss}.${cs}`;
+
+        // Ghép các từ bằng một khoảng trắng và chuẩn hoá khoảng trắng
+        const text = ((sentence.words || []).map(w => w.data).join(' ')).replace(/\s+/g, ' ').trim() || '';
+        lines.push(`[${timestamp}]${text}`);
+      }
+
+      const lrc = lines.join('\n');
+      res.set('Content-Type', 'text/plain; charset=utf-8');
+      return res.send(lrc);
+    }
+
+    if (parsed.type === 'text') {
+      // If text already contains LRC-like timestamps, return as-is; otherwise return plain text lines as LRC body
+      const text = parsed.text;
+      const hasTimestamp = /\[\d{1,2}:\d{2}(?:\.\d{1,2})?\]/.test(text);
+      res.set('Content-Type', 'text/plain; charset=utf-8');
+      if (hasTimestamp) return res.send(text);
+
+      // No timestamps — return text lines (ESP32 may parse plain LRC without timestamps)
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      return res.send(lines.join('\n'));
+    }
+
+    if (parsed.type === 'file') {
+      try {
+        console.log('🎼 /lyric.lrc fetching external LRC file:', parsed.url);
+        const r = await fetch(parsed.url);
+        if (!r.ok) throw new Error('Failed to fetch LRC file: ' + r.status);
+        const text = await r.text();
+        res.set('Content-Type', 'text/plain; charset=utf-8');
+        return res.send(text);
+      } catch (e) {
+        console.log('⚠️ Failed to fetch external LRC file for', songId, e.message);
+        return res.status(502).send('Không thể tải file lời từ nguồn ngoài');
+      }
+    }
+
+    try {
+      console.log('⚠️ /lyric.lrc no parsed lyric for', songId, '- raw lyricDetail:', JSON.stringify(lyricDetail).slice(0,20000));
+    } catch (e) {
+      console.log('⚠️ /lyric.lrc no parsed lyric and failed to stringify lyricDetail for', songId);
+    }
+    return res.status(404).send("Không có lời bài hát");
+
+  } catch (err) {
+    console.error("🔥 Lỗi lấy lời bài hát (LRC):", err);
+    res.status(500).send("Lỗi server: " + err.message);
   }
 });
 
